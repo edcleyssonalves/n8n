@@ -17,6 +17,7 @@ x-shared: &shared
     - N8N_RUNNERS_AUTH_TOKEN=${RUNNERS_AUTH_TOKEN}
     - N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0
     - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+    - N8N_DISABLE_PRODUCTION_MAIN_PROCESS=false 
   volumes:
     - n8n_storage:/home/node/.n8n
   depends_on:
@@ -31,9 +32,14 @@ x-runner: &runner
   environment:
     - N8N_RUNNERS_AUTH_TOKEN=${RUNNERS_AUTH_TOKEN}
 
+networks:
+  infra-net:     # Rede isolada para banco e cache
+  app-net:       # Rede para comunicação do n8n e workers
+  runner-net:    # Rede isolada apenas para os runners conversarem com o n8n
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
     restart: always
     environment:
       - POSTGRES_USER
@@ -44,8 +50,10 @@ services:
     volumes:
       - db_storage:/var/lib/postgresql/data
       - ./init-data.sh:/docker-entrypoint-initdb.d/init-data.sh
+    networks:
+      - infra-net
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
       interval: 5s
       timeout: 5s
       retries: 10
@@ -55,6 +63,9 @@ services:
     restart: always
     volumes:
       - redis_storage:/data
+    networks:
+      - infra-net
+      - app-net
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -63,20 +74,43 @@ services:
 
   n8n:
     <<: *shared
+    # Em produção, trave a porta apenas para o localhost. 
+    # O acesso externo deve ser feito via Proxy Reverso (Nginx/Traefik) na porta 80/443
     ports:
-      - 5678:5678
+      - 127.0.0.1:5678:5678
+    networks:
+      - infra-net
+      - app-net
+      - runner-net
 
   n8n-runner:
     <<: *runner
     environment:
       - N8N_RUNNERS_AUTH_TOKEN=${RUNNERS_AUTH_TOKEN}
       - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
+    networks:
+      - runner-net
     depends_on:
       - n8n
 
   n8n-worker:
     <<: *shared
     command: worker
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_NON_ROOT_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      # O worker não escuta broker de runner, ele apenas repassa tarefas se necessário
+    networks:
+      - infra-net
+      - app-net
+      - runner-net
     depends_on:
       - n8n
 
@@ -84,9 +118,12 @@ services:
     <<: *runner
     environment:
       - N8N_RUNNERS_AUTH_TOKEN=${RUNNERS_AUTH_TOKEN}
-      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n-worker:5679
+      # CORREÇÃO: Aponta para o n8n principal, que é quem gerencia o Broker de Tasks
+      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
+    networks:
+      - runner-net
     depends_on:
-      - n8n-worker
+      - n8n
 
 volumes:
   db_storage:
